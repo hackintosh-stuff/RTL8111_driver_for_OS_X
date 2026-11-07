@@ -275,7 +275,15 @@ bool RTL8111::setupRxResources()
     }
     rxDescArray = (RtlDmaDesc *)rxBufDesc->getBytesNoCopy();
 
-    rxDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, mapper, NULL);
+    /* Rings and data buffers must share one address space. With VTD disabled the
+     * buffers are mapped by mbuf_data_to_physical() / IOMbufNaturalMemoryCursor
+     * (physical addresses), and the statistics ring already uses an IODMACommand
+     * without a mapper. Passing a device-specific IOMapper only for the rx/tx
+     * rings leaves the NIC unable to fetch and retire descriptors. A third-party
+     * IOMapper attaching "iommu-parent" triggers this while
+     * serviceMatching("AppleVTD") finds nothing, and the tx deadlock watchdog
+     * then resets the chipset every 3 seconds. */
+    rxDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useAppleVTD ? mapper : NULL, NULL);
     
     if (!rxDescDmaCmd) {
         IOLog("Couldn't alloc rxDescDmaCmd.\n");
@@ -402,7 +410,8 @@ bool RTL8111::setupTxResources()
     }
     txDescArray = (RtlDmaDesc *)txBufDesc->getBytesNoCopy();
     
-    txDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, mapper, NULL);
+    /* See setupRxResources(): keep rings and data buffers in one address space. */
+    txDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useAppleVTD ? mapper : NULL, NULL);
     
     if (!txDescDmaCmd) {
         IOLog("Couldn't alloc txDescDmaCmd.\n");
