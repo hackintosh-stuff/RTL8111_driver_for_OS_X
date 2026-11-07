@@ -20,6 +20,8 @@
 
 
 #include "RealtekRTL8111.hpp"
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 
 #pragma mark --- function prototypes ---
 
@@ -97,6 +99,11 @@ bool RTL8111::init(OSDictionary *properties)
         enableCSO6 = false;
         disableASPM = false;
         useIOMapper = false;
+        pmBlocked = false;
+        pmWakeObserved = false;
+        pmPowerRestored = false;
+        pmGuardTicks = 0;
+        pmNotifier = NULL;
         pciPMCtrlOffset = 0;
         
         /* Create a random Ethernet address. */
@@ -117,6 +124,8 @@ done:
 void RTL8111::free()
 {
     UInt32 i;
+    
+    unregisterPowerInterest();
     
     DebugLog("free() ===>\n");
     
@@ -226,6 +235,11 @@ bool RTL8111::start(IOService *provider)
         IOLog("attachInterface() failed.\n");
         goto error_src;
     }
+    /* System-level sleep/wake interest is an IOKit facility, independent
+     * of which IOMapper (if any) is attached. It arrives before our own
+     * setPowerState(off), closing the guard window early. */
+    pmNotifier = registerSleepWakeInterest(pmSleepWakeHandler, this, NULL);
+
     pciDevice->close(this);
     result = true;
     
@@ -259,6 +273,8 @@ error_open:
 void RTL8111::stop(IOService *provider)
 {
     UInt32 i;
+    
+    unregisterPowerInterest();
     
     if (netif) {
         detachInterface(netif);
@@ -296,6 +312,71 @@ void RTL8111::stop(IOService *provider)
     super::stop(provider);
 }
 
+#pragma mark --- system power interest ---
+
+IOReturn RTL8111::pmSleepWakeHandler(void *target, void *refCon,
+                                     UInt32 messageType, IOService *provider,
+                                     void *messageArgument, vm_size_t argSize)
+{
+    (void)refCon; (void)provider; (void)messageArgument; (void)argSize;
+    RTL8111 *self = static_cast<RTL8111 *>(target);
+
+    if (!self)
+        return kIOReturnSuccess;
+
+    switch (messageType) {
+    case kIOMessageSystemWillSleep:
+        /* A mapper may suspend on this same notification, before our own
+         * setPowerState(off) runs. Block watchdog restarts here so no
+         * unmap can race that transition. Only a device that actually uses
+         * an IOMapper needs the guard; useIOMapper is a generic presence
+         * check, not an implementation-specific test. */
+        self->pmBlocked = self->useIOMapper;
+        self->pmWakeObserved = false;
+        self->pmPowerRestored = false;
+        self->pmGuardTicks = 0;
+        break;
+
+    case kIOMessageSystemHasPoweredOn:
+        self->pmWakeObserved = true;
+        break;
+
+    default:
+        break;
+    }
+
+    /* Returning success with an untouched argument acknowledges at once;
+     * this driver does not delay system sleep. */
+    return kIOReturnSuccess;
+}
+
+void RTL8111::unregisterPowerInterest(void)
+{
+    if (pmNotifier) {
+        pmNotifier->disable();
+        pmNotifier->release();
+        pmNotifier = NULL;
+    }
+}
+
+void RTL8111::pmGuardTick(void)
+{
+    if (!pmBlocked)
+        return;
+
+    ++pmGuardTicks;
+
+    /* Release after a real wake, our own power callback and the link are
+     * all back, with a short minimum hold. The upper bound keeps the
+     * watchdog from staying disabled forever if a notification or the
+     * link never returns. No mapper property, class name or private RPC
+     * is consulted: this is identical for any IOMapper implementation. */
+    if (pmGuardTicks >= kPMMaxResumeTicks ||
+        (pmWakeObserved && pmPowerRestored && linkUp &&
+         pmGuardTicks >= kPMMinResumeTicks))
+        pmBlocked = false;
+}
+
 /* Power Management Support */
 static IOPMPowerState powerStateArray[kPowerStateCount] =
 {
@@ -319,6 +400,15 @@ IOReturn RTL8111::setPowerState(unsigned long powerStateOrdinal, IOService *poli
     IOReturn result = IOPMAckImplied;
     
     DebugLog("setPowerState() ===>\n");
+
+    /* Fallback when system power interest is unavailable. The notifier
+     * normally sets these earlier. Only mapped devices need the guard. */
+    if (powerStateOrdinal == kPowerStateOff) {
+        pmBlocked = useIOMapper;
+        pmWakeObserved = false;
+        pmPowerRestored = false;
+        pmGuardTicks = 0;
+    }
         
     if (powerStateOrdinal == powerState) {
         DebugLog("Already in power state %lu.\n", powerStateOrdinal);
@@ -326,10 +416,15 @@ IOReturn RTL8111::setPowerState(unsigned long powerStateOrdinal, IOService *poli
     }
     DebugLog("switching to power state %lu.\n", powerStateOrdinal);
     
-    if (powerStateOrdinal == kPowerStateOff)
+    if (powerStateOrdinal == kPowerStateOff) {
         commandGate->runAction(setPowerStateSleepAction);
-    else
+    } else {
         commandGate->runAction(setPowerStateWakeAction);
+        if (pmBlocked) {
+            pmWakeObserved = true;
+            pmPowerRestored = true;
+        }
+    }
 
     powerState = powerStateOrdinal;
     
@@ -1366,6 +1461,13 @@ done:
 bool RTL8111::checkForDeadlock()
 {
     bool deadlock = false;
+
+    /* PM admission guard: no TX deadlock detection while the IOMMU is
+     * suspended or still inside its resume window. */
+    if (pmBlocked) {
+        deadlockWarn = 0;
+        return false;
+    }
     
     if ((txDescDoneCount == txDescDoneLast) && (txNumFreeDesc < kNumTxDesc)) {        
         if (++deadlockWarn == kTxCheckTreshhold) {
@@ -1706,6 +1808,8 @@ void RTL8111::updateStatitics()
 
 void RTL8111::timerActionRTL8111C(IOTimerEventSource *timer)
 {
+    pmGuardTick();
+
     if (!linkUp) {
         DebugLog("Timer fired while link down.\n");
         goto done;
@@ -1735,6 +1839,8 @@ done:
 
 void RTL8111::timerActionRTL8111B(IOTimerEventSource *timer)
 {
+    pmGuardTick();
+
 	UInt8 currLinkState;
     bool newLinkState;
 

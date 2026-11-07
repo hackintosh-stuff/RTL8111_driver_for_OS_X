@@ -20,6 +20,7 @@
 
 #include "RealtekRTL8111Linux-804704.hpp"
 #include "RealtekRxPool.hpp"
+#include <IOKit/IONotifier.h>
 
 #ifdef DEBUG
 #define DebugLog(args...) IOLog(args)
@@ -166,6 +167,12 @@ typedef struct RtlStatData {
 #define kTxDeadlockTreshhold 3
 #define kTxCheckTreshhold (kTxDeadlockTreshhold - 1)
 
+/* Bounds for the post-resume watchdog guard. The release condition uses
+ * only IOKit power notifications and this driver's own power/link state,
+ * so it applies unchanged to every IOMapper implementation. */
+#define kPMMinResumeTicks 3
+#define kPMMaxResumeTicks 30
+
 /* IPv4 specific stuff */
 #define kMinL4HdrOffsetV4 34
 
@@ -291,6 +298,11 @@ public:
 	virtual IOReturn registerWithPolicyMaker(IOService *policyMaker) override;
     virtual IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *policyMaker ) override;
 	virtual void systemWillShutdown(IOOptionBits specifier) override;
+    static IOReturn pmSleepWakeHandler(void *target, void *refCon,
+                                       UInt32 messageType, IOService *provider,
+                                       void *messageArgument, vm_size_t argSize);
+    void pmGuardTick(void);
+    void unregisterPowerInterest(void);
 
 	/* IONetworkController methods. */	
 	virtual IOReturn enable(IONetworkInterface *netif) override;
@@ -453,6 +465,11 @@ private:
 
     /* power management data */
     unsigned long powerState;
+    volatile bool pmBlocked;
+    volatile bool pmWakeObserved;
+    volatile bool pmPowerRestored;
+    volatile UInt32 pmGuardTicks;
+    IONotifier *pmNotifier;
     
     /* statistics data */
     UInt32 deadlockWarn;

@@ -667,6 +667,36 @@ void RTL8111::disableRTL8111()
 
 void RTL8111::restartRTL8111()
 {
+    /* PM admission guard: a restart tears down and remaps every DMA
+     * buffer. While the IOMMU is suspended or resuming it cannot confirm
+     * invalidation, and the mapper fail-stops. Refuse the restart instead. */
+    if (pmBlocked)
+        return;
+
+    /* With mapped DMA the rings and packet buffers are IOMapper mappings. The
+     * upstream shortcut below remaps them while the MSI event source is still
+     * live, so an unmap can retire pages before its invalidation is confirmed;
+     * a mapper that fail-stops on that condition panics. Reuse the ordinary
+     * driver path, which stops the interrupt source and quiesces the hardware
+     * before any mapping is torn down. Physical-address mode keeps the fast path. */
+    if (useIOMapper) {
+        IOReturn result;
+
+        if (!isEnabled)
+            return;
+
+        linkUp = false;
+        setLinkStatus(kIONetworkLinkValid);
+
+        result = disable(netif);
+        if (result == kIOReturnSuccess)
+            result = enable(netif);
+        if (result != kIOReturnSuccess)
+            IOLog("RTL8111: mapped watchdog restart failed (0x%x).\n", (UInt32)result);
+
+        return;
+    }
+
     /* Stop output thread and flush txQueue */
     netif->stopOutputThread();
     netif->flushOutputQueue();
