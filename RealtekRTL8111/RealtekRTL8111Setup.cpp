@@ -16,7 +16,6 @@ static const char *offName = "disabled";
 void RTL8111::getParams()
 {
     OSDictionary *params;
-    OSIterator *iterator;
     OSBoolean *enableEEE;
     OSBoolean *tso4;
     OSBoolean *tso6;
@@ -25,24 +24,12 @@ void RTL8111::getParams()
     OSString *versionString;
     OSString *fbAddr;
 
-    if (version_major >= Tahoe) {
-        params = serviceMatching("AppleVTD");
-        
-        if (params) {
-            iterator = IOService::getMatchingServices(params);
-            
-            if (iterator) {
-                IOMapper *mp = OSDynamicCast(IOMapper, iterator->getNextObject());
-                
-                if (mp) {
-                    IOLog("AppleVTD is enabled.");
-                    useAppleVTD = true;
-                }
-                iterator->release();
-            }
-            params->release();
-        }
-    }
+    /* Enable the IOMapper DMA path whenever this device has an IOMapper.
+     * copyMapperForDevice() resolves the device's "iommu-parent" property,
+     * so this covers AppleVTD and third-party mappers alike. */
+    useIOMapper = (mapper != NULL);
+    if (useIOMapper)
+        IOLog("IOMapper is enabled.");
     versionString = OSDynamicCast(OSString, getProperty(kDriverVersionName));
 
     params = OSDynamicCast(OSDictionary, getProperty(kParamName));
@@ -203,7 +190,7 @@ bool RTL8111::initEventSources(IOService *provider)
     if (msiIndex != -1) {
         DebugLog("MSI interrupt index: %d\n", msiIndex);
         
-        if (useAppleVTD) {
+        if (useIOMapper) {
             interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8111::interruptOccurredVTD), provider, msiIndex);
         } else {
             interruptSource = IOInterruptEventSource::interruptEventSource(this, OSMemberFunctionCast(IOInterruptEventSource::Action, this, &RTL8111::interruptOccurredPoll), provider, msiIndex);
@@ -275,15 +262,14 @@ bool RTL8111::setupRxResources()
     }
     rxDescArray = (RtlDmaDesc *)rxBufDesc->getBytesNoCopy();
 
-    /* Rings and data buffers must share one address space. With VTD disabled the
-     * buffers are mapped by mbuf_data_to_physical() / IOMbufNaturalMemoryCursor
-     * (physical addresses), and the statistics ring already uses an IODMACommand
-     * without a mapper. Passing a device-specific IOMapper only for the rx/tx
-     * rings leaves the NIC unable to fetch and retire descriptors. A third-party
-     * IOMapper attaching "iommu-parent" triggers this while
-     * serviceMatching("AppleVTD") finds nothing, and the tx deadlock watchdog
-     * then resets the chipset every 3 seconds. */
-    rxDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useAppleVTD ? mapper : NULL, NULL);
+    /* Rings and data buffers must share one address space. With the IOMapper
+     * path disabled the buffers are mapped by mbuf_data_to_physical() /
+     * IOMbufNaturalMemoryCursor (physical addresses), and the statistics ring
+     * already uses an IODMACommand without a mapper. Passing a device-specific
+     * IOMapper only for the rx/tx rings leaves the NIC unable to fetch and
+     * retire descriptors, tripping the tx deadlock watchdog every 3 seconds.
+     * Keep the ring mapping in sync with useIOMapper. */
+    rxDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useIOMapper ? mapper : NULL, NULL);
     
     if (!rxDescDmaCmd) {
         IOLog("Couldn't alloc rxDescDmaCmd.\n");
@@ -329,7 +315,7 @@ bool RTL8111::setupRxResources()
         }
         rxBufArray[i].mbuf = m;
 
-        if (!useAppleVTD) {
+        if (!useIOMapper) {
             word1 = (kRxBufferSize | DescOwn);
 
             if (i == kRxLastDesc)
@@ -342,10 +328,13 @@ bool RTL8111::setupRxResources()
             rxDescArray[i].buf.addr = OSSwapHostToLittleInt64(pa);
         }
     }
-    if (useAppleVTD)
+    if (useIOMapper) {
         result = setupRxMap();
-    else
+        if (!result)
+            goto error_buf;
+    } else {
         result = true;
+    }
 
 done:
     return result;
@@ -411,7 +400,7 @@ bool RTL8111::setupTxResources()
     txDescArray = (RtlDmaDesc *)txBufDesc->getBytesNoCopy();
     
     /* See setupRxResources(): keep rings and data buffers in one address space. */
-    txDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useAppleVTD ? mapper : NULL, NULL);
+    txDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, useIOMapper ? mapper : NULL, NULL);
     
     if (!txDescDmaCmd) {
         IOLog("Couldn't alloc txDescDmaCmd.\n");
@@ -440,7 +429,7 @@ bool RTL8111::setupTxResources()
     txNextDescIndex = txDirtyDescIndex = 0;
     txNumFreeDesc = kNumTxDesc;
     
-    if (useAppleVTD) {
+    if (useIOMapper) {
         result = setupTxMap();
         
         if (!result)
@@ -499,7 +488,7 @@ bool RTL8111::setupStatResources()
     }
     statData = (RtlStatData *)statBufDesc->getBytesNoCopy();
     
-    statDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1);
+    statDescDmaCmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, mapper, NULL);
     
     if (!statDescDmaCmd) {
         IOLog("Couldn't alloc statDescDmaCmd.\n");
@@ -544,7 +533,7 @@ void RTL8111::freeRxResources()
 {
     UInt32 i;
     
-    if (useAppleVTD)
+    if (useIOMapper)
         freeRxMap();
 
     if (rxDescDmaCmd) {
@@ -576,7 +565,7 @@ void RTL8111::freeRxResources()
 
 void RTL8111::freeTxResources()
 {
-    if (useAppleVTD)
+    if (useIOMapper)
         freeTxMap();
     else
         RELEASE(txMbufCursor);
@@ -623,14 +612,29 @@ void RTL8111::clearDescriptors()
     UInt64 word1;
     UInt32 lastIndex = kTxLastDesc;
     UInt32 i;
+
+    /* The ring rewrite below unmaps and remaps every RX batch to different
+     * IOVAs. Descriptors still owned by the NIC would then point into
+     * invalidated pages, so RX DMA must be stopped and drained first. */
+    if (useIOMapper) {
+        UInt16 mask = ReadReg16(IntrMask);
+        WriteReg16(IntrMask, 0);
+        WriteReg8(ChipCmd, ReadReg8(ChipCmd) & ~(CmdRxEnb | CmdTxEnb));
+        OSSynchronizeIO();
+        IOSleep(20);
+        WriteReg16(IntrStatus, ReadReg16(IntrStatus));
+        WriteReg16(IntrMask, mask);
+    }
     
     DebugLog("clearDescriptors() ===>\n");
     
-    if (useAppleVTD && txMapInfo) {
+    if (useIOMapper && txMapInfo) {
         for (i = 0; i < kNumTxMemDesc; i++) {
             md = txMapInfo->txMemIO[i];
             
             if (md && (md->getTag() == kIOMemoryActive)) {
+                if (txMapInfo->txDmaCmd[i])
+                    txMapInfo->txDmaCmd[i]->clearMemoryDescriptor();
                 md->complete();
                 md->setTag(kIOMemoryInactive);
             }
@@ -650,7 +654,7 @@ void RTL8111::clearDescriptors()
     txDirtyDescIndex = txNextDescIndex = 0;
     txNumFreeDesc = kNumTxDesc;
     
-    if (useAppleVTD)
+    if (useIOMapper)
         rxMapBuffers(0, kNumRxMemDesc);
 
     for (i = 0; i < kNumRxDesc; i++) {

@@ -779,7 +779,7 @@ void RTL8111::setupRTL8111(UInt16 newIntrMitigate, bool enableInterrupts)
 
     WriteReg8(Config5, ReadReg8(Config5) & ~BIT_7);
     
-    if (useAppleVTD) {
+    if (useIOMapper) {
         txMapInfo->txNextMem2Use = txMapInfo->txNextMem2Free = 0;
         txMapInfo->txNumFreeMem = kNumTxMemDesc;
     }

@@ -96,7 +96,7 @@ bool RTL8111::init(OSDictionary *properties)
         enableTSO6 = false;
         enableCSO6 = false;
         disableASPM = false;
-        useAppleVTD = false;
+        useIOMapper = false;
         pciPMCtrlOffset = 0;
         
         /* Create a random Ethernet address. */
@@ -465,7 +465,7 @@ IOReturn RTL8111::outputStart(IONetworkInterface *interface, IOOptionBits option
         DebugLog("Interface down. Dropping packets.\n");
         goto done;
     }
-    while ((txNumFreeDesc > (kMaxSegs + 3)) && (interface->dequeueOutputPackets(1, &m, NULL, NULL, NULL) == kIOReturnSuccess)) {
+    while ((txNumFreeDesc > (kMaxSegs + 3)) && (!useIOMapper || txMapInfo->txNumFreeMem > 1) && (interface->dequeueOutputPackets(1, &m, NULL, NULL, NULL) == kIOReturnSuccess)) {
         cmd = 0;
         opts2 = 0;
 
@@ -488,7 +488,7 @@ IOReturn RTL8111::outputStart(IONetworkInterface *interface, IOOptionBits option
             getChecksumCommand(&cmd, &opts2, checksums);
         }
         /* Finally get the physical segments. */
-        if (useAppleVTD)
+        if (useIOMapper)
             numSegs = txMapPacket(m, txSegments, kMaxSegs);
         else
             numSegs = txMbufCursor->getPhysicalSegmentsWithCoalesce(m, txSegments, kMaxSegs);
@@ -538,7 +538,7 @@ IOReturn RTL8111::outputStart(IONetworkInterface *interface, IOOptionBits option
     /* Set the polling bit. */
     WriteReg8(TxPoll, NPQ);
 
-    result = (txNumFreeDesc > (kMaxSegs + 3)) ? kIOReturnSuccess : kIOReturnNoResources;
+    result = (txNumFreeDesc > (kMaxSegs + 3) && (!useIOMapper || txMapInfo->txNumFreeMem > 1)) ? kIOReturnSuccess : kIOReturnNoResources;
     
 done:
     //DebugLog("outputStart() <===\n");
@@ -1074,7 +1074,7 @@ void RTL8111::txInterrupt()
 
         m = txMbufArray[txDirtyDescIndex];
         
-        if (useAppleVTD && m)
+        if (useIOMapper && m)
             txUnmapPacket();
 
         txNext2FreeMbuf = m;
@@ -1423,7 +1423,7 @@ void RTL8111::pollInputPackets(IONetworkInterface *interface, uint32_t maxCount,
 {
     //DebugLog("pollInputPackets() ===>\n");
     
-    if (useAppleVTD)
+    if (useIOMapper)
         rxInterruptVTD(interface, maxCount, pollQueue, context);
     else
         rxInterrupt(interface, maxCount, pollQueue, context);

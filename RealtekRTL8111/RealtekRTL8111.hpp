@@ -228,12 +228,14 @@ typedef struct rtlTxMapInfo {
     UInt16 txNextMem2Free;
     SInt16 txNumFreeMem;
     IOMemoryDescriptor *txMemIO[kNumTxMemDesc];
+    IODMACommand *txDmaCmd[kNumTxMemDesc];
     IOAddressRange txMemRange[kNumTxRanges];
     IOAddressRange txSCRange[kMaxSegs];
 } rtlTxMapInfo;
 
 typedef struct rtlRxMapInfo {
     IOMemoryDescriptor *rxMemIO[kNumRxMemDesc];
+    IODMACommand *rxDmaCmd[kNumRxMemDesc];
     IOAddressRange rxMemRange[kNumRxDesc];
 } rtlRxMapInfo;
 
@@ -499,7 +501,7 @@ private:
     bool enableTSO6;
     bool enableCSO6;
     bool disableASPM;
-    bool useAppleVTD;
+    bool useIOMapper;
 
     UInt8 pciPMCtrlOffset;
 };
